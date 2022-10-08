@@ -40,6 +40,7 @@ var flTags = pflag.StringSlice("tag", nil, "build tags to pass to Go (see 'go he
 var flRelPath = pflag.String("relative-to", ".", "emit by-path rules for packages relative to this path")
 var flImports = pflag.Bool("imports", false, "process all imports of all packages, recursively")
 var flStateDir = pflag.String("state-dir", ".go2make", "directory in which to store state used by make")
+var flIgnoreErrors = pflag.BoolP("ignore-errors", "e", false, "ignore package errors")
 
 var lastDebugTime time.Time
 
@@ -63,12 +64,13 @@ func debug(items ...interface{}) {
 }
 
 type emitter struct {
-	roots    []string
-	prune    []string
-	tags     []string
-	relPath  string
-	imports  bool
-	stateDir string
+	roots        []string
+	prune        []string
+	tags         []string
+	ignoreErrors bool
+	relPath      string
+	imports      bool
+	stateDir     string
 }
 
 func main() {
@@ -110,12 +112,13 @@ func main() {
 
 	// Gather flag values for easier testing.
 	emit := emitter{
-		roots:    forEach(*flRoots, dropTrailingSlash),
-		prune:    forEach(*flPrune, dropTrailingSlash),
-		tags:     *flTags,
-		relPath:  dropTrailingSlash(absOrExit(*flRelPath)),
-		imports:  *flImports,
-		stateDir: dropTrailingSlash(*flStateDir),
+		roots:        forEach(*flRoots, dropTrailingSlash),
+		prune:        forEach(*flPrune, dropTrailingSlash),
+		tags:         *flTags,
+		ignoreErrors: *flIgnoreErrors,
+		relPath:      dropTrailingSlash(absOrExit(*flRelPath)),
+		imports:      *flImports,
+		stateDir:     dropTrailingSlash(*flStateDir),
 	}
 	debug("roots:", emit.roots)
 	debug("prune:", emit.prune)
@@ -128,12 +131,8 @@ func main() {
 		os.Exit(1)
 	}
 
-	pkgMap, errs := emit.visitPackages(pkgs)
-	if len(errs) > 0 {
-		fmt.Fprintf(os.Stderr, "error processing packages:\n")
-		for _, e := range errs {
-			fmt.Fprintf(os.Stderr, "  %s\n", e.Msg)
-		}
+	pkgMap := emit.visitPackages(pkgs)
+	if pkgMap == nil {
 		os.Exit(1)
 	}
 
@@ -211,68 +210,63 @@ func (emit emitter) loadPackages(targets ...string) ([]*packages.Package, error)
 	return packages.Load(&cfg, targets...)
 }
 
-func (emit emitter) visitPackages(pkgs []*packages.Package) (map[string]*packages.Package, []packages.Error) {
+func (emit emitter) visitPackages(pkgs []*packages.Package) map[string]*packages.Package {
 	pkgMap := map[string]*packages.Package{}
+	errs := false
 	for _, p := range pkgs {
-		errs := emit.visitPackage(p, pkgMap)
-		if len(errs) > 0 {
-			return nil, errs
+		ok := emit.visitPackage(p, pkgMap)
+		if !ok {
+			errs = true
 		}
 	}
-	return pkgMap, nil
+	if errs {
+		return nil
+	}
+	return pkgMap
 }
 
-func (emit emitter) visitPackage(pkg *packages.Package, pkgMap map[string]*packages.Package) []packages.Error {
+func (emit emitter) visitPackage(pkg *packages.Package, pkgMap map[string]*packages.Package) bool {
 	debug("visiting package", pkg.PkgPath)
 	if pkgMap[pkg.PkgPath] == pkg {
 		debug("  ", pkg.PkgPath, "was already visited")
-		return nil
+		return true
 	}
 
 	if len(emit.roots) > 0 && !rooted(pkg.PkgPath, emit.roots) {
 		debug("  ", pkg.PkgPath, "is not under an allowed root")
-		return nil
+		return true
 	}
 
 	if len(emit.prune) > 0 && rooted(pkg.PkgPath, emit.prune) {
 		debug("  ", pkg.PkgPath, "pruned")
-		return nil
-	}
-
-	if len(pkg.Errors) > 0 {
-		debug("  ", pkg.PkgPath, "has errors:")
-		errs := []packages.Error{}
-		for _, e := range pkg.Errors {
-			debug("    ", fmt.Sprintf("%q", e))
-			if e.Kind == packages.ListError {
-				// ignore errors like "build constraints exclude all Go files"
-				debug("    ignoring error")
-				continue
-			}
-			errs = append(errs, e)
-		}
-		if len(errs) > 0 {
-			return errs
-		}
+		return true
 	}
 
 	debug("  ", pkg.PkgPath, "is new")
 	pkgMap[pkg.PkgPath] = pkg
 
-	if emit.imports && len(pkg.Imports) > 0 {
-		debug("  ", pkg.PkgPath, "has", len(pkg.Imports), "imports")
-
-		allErrs := []packages.Error{}
-		visitEach(pkg.Imports, func(imp *packages.Package) {
-			errs := emit.visitPackage(imp, pkgMap)
-			if len(errs) > 0 {
-				allErrs = append(allErrs, errs...)
-			}
-		})
-		return allErrs
+	ok := true
+	for _, e := range pkg.Errors {
+		if emit.ignoreErrors {
+			debug("    ignoring error:", e.Msg)
+		} else {
+			fmt.Fprintf(os.Stderr, "%s\n", e.Msg)
+			ok = false
+		}
 	}
 
-	return nil
+	// Don't recurse if we have errors already.
+	if ok && emit.imports && len(pkg.Imports) > 0 {
+		debug("  ", pkg.PkgPath, "has", len(pkg.Imports), "imports")
+
+		visitEach(pkg.Imports, func(imp *packages.Package) {
+			if !emit.visitPackage(imp, pkgMap) {
+				ok = false
+			}
+		})
+	}
+
+	return ok
 }
 
 func rooted(pkg string, list []string) bool {
